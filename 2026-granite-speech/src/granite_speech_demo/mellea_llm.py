@@ -5,16 +5,22 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 
 from mellea.backends.model_options import ModelOption
 from mellea.backends.openai import OpenAIBackend
 from mellea.stdlib.components.chat import Message as MelleaMessage
 from mellea.stdlib.components.docs import Document
-from mellea.stdlib.components.intrinsic import core
 from mellea.stdlib.context import ChatContext
 import mellea.stdlib.functional as mfuncs
+
+from granite_speech_demo.requirements import (
+    IVR_REQUIREMENTS,
+    IVR_REQUIREMENT_INSTRUCTIONS,
+    IVR_REQUIREMENT_LABELS,
+    IVR_REQUIREMENT_SPECS,
+    RequirementSpec,
+)
 
 from pipecat.frames.frames import (
     Frame,
@@ -35,34 +41,27 @@ LLM_URL = os.environ.get("LLM_URL", "http://localhost:8000/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "ibm-granite/granite-switch-4.1-3b-preview")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "EMPTY")
 
-DEFAULT_REQUIREMENT_THRESHOLD = 0.5
-
-
-@dataclass(frozen=True)
-class RequirementSpec:
-    label: str
-    description: str
-    instruction: str
-    threshold: float = DEFAULT_REQUIREMENT_THRESHOLD
-
-
-IVR_REQUIREMENT_SPECS = [
-    RequirementSpec(
-        label="No markdown",
-        description="The response contains no bullet points, no numbered lists, no headers, and no markdown formatting.",
-        instruction="No bullet points. No numbered lists. No headers. No markdown formatting.",
-    ),
-]
-
-IVR_REQUIREMENTS = [spec.description for spec in IVR_REQUIREMENT_SPECS]
-IVR_REQUIREMENT_LABELS = [spec.label for spec in IVR_REQUIREMENT_SPECS]
-IVR_REQUIREMENT_THRESHOLDS = [spec.threshold for spec in IVR_REQUIREMENT_SPECS]
-IVR_REQUIREMENT_INSTRUCTIONS = [
-    spec.instruction for spec in IVR_REQUIREMENT_SPECS]
+IVR_VALIDATION_DEFAULT = os.environ.get("IVR_VALIDATION", "false").lower() in ("1", "true", "yes")
 
 BEST_OF_N = 3
 
-_BASE_SYSTEM_INSTRUCTION = (
+def _load_prompt_file() -> str | None:
+    prompt_file = os.environ.get("PROMPT_FILE", "")
+    if not prompt_file:
+        return None
+    path = Path(prompt_file)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    if not path.is_file():
+        logger.warning("PROMPT_FILE={!r} is not a file, skipping", prompt_file)
+        return None
+    text = path.read_text().strip()
+    if text:
+        logger.info("Loaded system prompt from {} ({} chars)", path, len(text))
+    return text or None
+
+
+_BASE_SYSTEM_INSTRUCTION = _load_prompt_file() or (
     "You are Granite, IBM's real-time interactive speech assistant, running live."
 )
 
@@ -127,12 +126,10 @@ SYSTEM_INSTRUCTION_WITH_REQS = _documents_block + \
 INSTRUCT_TEMPLATE = _DEFAULT_INSTRUCT_TEMPLATE
 
 
-def _check_one_requirement(gen_ctx, backend, req_desc, req_index, gen_index, t0, emit,
-                           threshold=DEFAULT_REQUIREMENT_THRESHOLD):
+def _check_one_requirement(gen_ctx, backend, spec, req_index, gen_index, t0, emit):
     """Run a single requirement check. Executed in a thread."""
     check_started = time.monotonic()
-    score = core.requirement_check(gen_ctx, backend, req_desc)
-    passed = score > threshold
+    passed, score, threshold = spec.check(gen_ctx, backend)
     if emit is not None:
         emit({
             "phase": "check",
@@ -144,7 +141,7 @@ def _check_one_requirement(gen_ctx, backend, req_desc, req_index, gen_index, t0,
             "ms": int((time.monotonic() - check_started) * 1000),
             "t_ms": int((time.monotonic() - t0) * 1000),
         })
-    return {"description": req_desc, "passed": passed, "score": score, "threshold": threshold}
+    return {"description": spec.description, "passed": passed, "score": score, "threshold": threshold}
 
 
 def _single_generation(action, ctx, backend, model_options, requirements, validate,
@@ -169,18 +166,12 @@ def _single_generation(action, ctx, backend, model_options, requirements, valida
     if not validate:
         return {"answer": answer, "requirements": [], "passed": True}
     with ThreadPoolExecutor(max_workers=len(requirements)) as req_executor:
-        futures = []
-        for i, req in enumerate(requirements):
-            if isinstance(req, RequirementSpec):
-                req_desc = req.description
-                threshold = req.threshold
-            else:
-                req_desc = req
-                threshold = DEFAULT_REQUIREMENT_THRESHOLD
-            futures.append(req_executor.submit(
-                _check_one_requirement, gen_ctx, backend, req_desc, i, gen_index, t0, emit,
-                threshold,
-            ))
+        futures = [
+            req_executor.submit(
+                _check_one_requirement, gen_ctx, backend, spec, i, gen_index, t0, emit,
+            )
+            for i, spec in enumerate(requirements)
+        ]
         req_results = [f.result() for f in futures]
     all_passed = all(r["passed"] for r in req_results)
 

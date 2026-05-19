@@ -1,14 +1,28 @@
 # granite-speech-demo
 
-Real-time voice conversation demo built on [Granite Speech](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) for transcription, [Granite Switch](https://huggingface.co/ibm-granite/granite-switch-4.1-3b-preview) for validated LLM generation via [Mellea](https://github.com/generative-computing/mellea)'s `requirement_check` intrinsics, and Pipecat for pipeline orchestration.
+A template for building real-time voice agents — speech in, validated language out. Built on [Pipecat](https://github.com/pipecat-ai/pipecat) for pipeline orchestration, [Mellea](https://github.com/generative-computing/mellea) for requirement-checked LLM calls, and any vLLM-served STT and chat models you point it at. Ships with a working example wired up around [Granite Speech 4.1](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) for transcription and [Granite Switch 4.1](https://huggingface.co/ibm-granite/granite-switch-4.1-3b-preview) for generation with `requirement_check` ALoRA intrinsics — clone it to talk to a Granite assistant out of the box, or swap the persona, grounding documents, and requirement set to build your own.
 
 ```
 Browser mic → WebRTC → Silero VAD → Granite Speech STT → Mellea LLM (via Granite Switch) → Kokoro TTS → WebRTC → Browser speaker
 ```
 
-STT is [IBM Granite Speech 4.1 2B](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) served by vLLM. The LLM is [IBM Granite Switch 4.1 3B](https://huggingface.co/ibm-granite/granite-switch-4.1-3b-preview), also served by vLLM — it exposes `requirement_check` ALoRA intrinsics that power the Best-of-N validation path (any other OpenAI-compatible server works if you don't need that path; point `LLM_URL` / `LLM_MODEL` at it). TTS is Kokoro running locally.
+STT is [IBM Granite Speech 4.1 2B](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) served by vLLM. The LLM is [IBM Granite Switch 4.1 3B](https://huggingface.co/ibm-granite/granite-switch-4.1-3b-preview), also served by vLLM — it exposes `requirement_check` ALoRA intrinsics that power the Best-of-N validation path (any other OpenAI-compatible server works if you don't need that path; point `LLM_URL` / `LLM_MODEL` at it). TTS is Kokoro running locally by default; set `TTS_BACKEND=hosted` to call a remote HTTP TTS server instead (POST `{"text": "..."}` → streamed raw PCM at `HOSTED_TTS_SAMPLE_RATE`).
 
-The server ships with a persona of a virtual assistant, configured as the default system prompt. Override via `PROMPT_FILE` or ground with your own docs via `DOCUMENTS_DIR`.
+## Try it without GPUs — run in Colab
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/generative-computing/mellea-demos/blob/main/2026-granite-speech/colab/granite_speech_demo.ipynb)
+
+The whole stack — both vLLM model servers, the Pipecat backend, and the Next.js frontend — runs in a single Colab notebook. Hit **Runtime → Run all**, wait for the last cell to print a `*.trycloudflare.com` URL, open it, allow mic access, talk.
+
+Caveats, since there's no free lunch:
+
+- **Colab Pro** for the GPU. A100 recommended; L4 works; T4 will OOM (both Granite models won't fit).
+- **A free HuggingFace read token**, added as a Colab Secret named `HF_TOKEN`. Used for model downloads and to mint per-session WebRTC TURN credentials (the relay is what lets browser audio reach a Colab runtime that has no public IP).
+- **~8–10 min cold start** the first time (model downloads dominate); ~3 min on subsequent runs with weights cached.
+- **24-hour kernel cap** and idle timeout — you'll get a fresh URL each session.
+- The public URL has no auth. Anyone with the link can join.
+
+Notebook source: [`colab/granite_speech_demo.ipynb`](colab/granite_speech_demo.ipynb).
 
 ## Generation modes
 
@@ -120,9 +134,21 @@ All settings are in `.env` (see `.env.example`).
 | `VLLM_SPEECH_PATH` | `/v1/chat/completions` | Path on the vLLM server for audio-in chat completions |
 | `VLLM_SPEECH_BEARER_TOKEN` | `token-abc123` | Bearer token sent to the vLLM speech endpoint |
 | `STT_KEYWORD_BIAS` | `Granite,Mellea` | Comma-separated terms appended to the STT prompt to bias transcription |
-| `TTS_VOICE` | `bf_emma` | Kokoro voice ID |
-| `PROMPT_FILE` | _(unset)_ | Path to a text file whose contents are prepended to the default system/instruct prompts. |
+| `TTS_BACKEND` | `kokoro` | TTS backend: `kokoro` (local) or `hosted` (remote HTTP server) |
+| `TTS_VOICE` | `bf_emma` | Kokoro voice ID (used when `TTS_BACKEND=kokoro`) |
+| `HOSTED_TTS_URL` | `http://localhost:8086` | Base URL of the remote TTS server (used when `TTS_BACKEND=hosted`) |
+| `HOSTED_TTS_PATH` | `/synth` | Path on the remote TTS server that accepts `POST {"text": "..."}` and streams raw PCM back |
+| `HOSTED_TTS_SAMPLE_RATE` | `24000` | Sample rate of the PCM audio returned by the hosted TTS server |
+| `PROMPT_FILE` | _(unset)_ | Path to a text file whose contents replace the default system prompt. See `prompts/granite.txt` for the persona used in the THINK 2026 demo. |
 | `DOCUMENTS_DIR` | _(unset)_ | Directory of `.txt` files loaded at import time as Mellea `Document` objects and injected into the system prompt inside `<documents>` tags for grounded answers. |
+
+## Make it your own
+
+This repo is a template. The Granite assistant is the included example, but the demo is built to be retargeted at whatever voice agent you want to ship. Three levers, in increasing order of invasiveness:
+
+- **Persona — `PROMPT_FILE`.** The system prompt that shapes the agent's identity and behavior. The default is a one-line generic prompt; `prompts/granite.txt` is the THINK 2026 example. Point at your own `.txt` file to swap personas without touching code.
+- **Grounding — `DOCUMENTS_DIR`.** A folder of `.txt` files, loaded at startup and embedded in the system prompt inside `<documents>` tags. Use it to anchor answers to your own product docs, FAQ, knowledge base, or anything else the model shouldn't be guessing at.
+- **Requirements — `IVR_REQUIREMENT_SPECS` in `src/granite_speech_demo/mellea_llm.py`.** The list of plain-English rules that every Best-of-N candidate is scored against. The defaults are voice-agent staples ("no markdown," "no code"). Add your own — domain-specific rules, tone constraints, "must cite a document" — and Mellea routes each one through Granite Switch's `requirement_check` adapter automatically.
 
 ## Granite Switch and Best-of-N validation
 
@@ -154,6 +180,7 @@ Requirement set, labels, instructions, and thresholds all live in `IVR_REQUIREME
 src/granite_speech_demo/
 ├── server.py          # FastAPI + SmallWebRTC signaling + pipeline wiring
 ├── hosted_stt.py      # HostedSTTService — streams audio to the vLLM Granite Speech endpoint
+├── hosted_tts.py      # HostedTTSService — POSTs text to a remote TTS server, streams PCM back
 └── mellea_llm.py      # MelleaLLMService — streaming path + Best-of-N IVR validation path, document loading
 
 frontend/              # Next.js app (Carbon Design System, IBM Plex fonts)
@@ -185,6 +212,6 @@ The module also loads optional `DOCUMENTS_DIR` `.txt` files into Mellea `Documen
 
 ## Dependencies
 
-- **[Pipecat AI](https://github.com/pipecat-ai/pipecat)** — pipeline orchestration (WebRTC, Silero VAD, STT/TTS services, SmartTurn)
+- **[IBM Granite models](https://huggingface.co/ibm-granite)** — Granite Speech 4.1 for transcription and Granite Switch 4.1 for chat with `requirement_check` ALoRA intrinsics
 - **[Mellea](https://github.com/generative-computing/mellea)** — LLM streaming with chunking and requirement-check validation
-- **IBM Granite models** — chat (`granite4.1:3b` by default, or a Granite Switch model for IVR validation)
+- **[Pipecat AI](https://github.com/pipecat-ai/pipecat)** — pipeline orchestration (WebRTC, Silero VAD, STT/TTS services, SmartTurn)
