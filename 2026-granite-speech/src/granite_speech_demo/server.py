@@ -23,26 +23,14 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.tts_service import TextAggregationMode
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
-from granite_speech_demo.hosted_stt import HostedSTTService
 from granite_speech_demo.hosted_tts import HostedTTSService
-from granite_speech_demo.mellea_llm import (
-    BEST_OF_N,
-    IVR_REQUIREMENT_LABELS,
-    MelleaLLMService,
-)
+from granite_speech_demo.audio_llm import AudioLLMService
 
 from loguru import logger as loguru_logger
 
@@ -117,43 +105,30 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, session_config: dict
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            # VAD now lives on the transport so the single audio service gets the
+            # turn-boundary frames it needs (previously the VAD was on the
+            # user aggregator, which we no longer use).
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.4)),
         ),
     )
 
-    stt = HostedSTTService()
+    # R3: one audio-enabled Granite Switch model does audio -> answer in a single
+    # request. No separate STT server, no Mellea LLM stage.
+    audio_llm = AudioLLMService()
     if TTS_BACKEND == "hosted":
-        tts = HostedTTSService(
-            text_aggregation_mode=TextAggregationMode.SENTENCE,
-        )
+        tts = HostedTTSService(text_aggregation_mode=TextAggregationMode.SENTENCE)
     else:
         tts = KokoroTTSService(
             settings=KokoroTTSService.Settings(voice=TTS_VOICE),
             text_aggregation_mode=TextAggregationMode.SENTENCE,
         )
 
-    ivr_validation = (session_config or {}).get("ivr_validation")
-    llm = MelleaLLMService(ivr_validation=ivr_validation)
-
-    context = LLMContext()
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.4)),
-            user_turn_strategies=UserTurnStrategies(
-                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.2)],
-            ),
-        ),
-    )
-
     pipeline = Pipeline(
         [
             transport.input(),
-            stt,
-            user_aggregator,
-            llm,
+            audio_llm,
             tts,
             transport.output(),
-            assistant_aggregator,
         ]
     )
 
@@ -172,10 +147,9 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, session_config: dict
 async def ivr_config():
     """Static config the frontend needs before any turn runs — lets it pre-render
     the validation grid with the real requirement labels and sample count."""
-    return {
-        "requirements": IVR_REQUIREMENT_LABELS,
-        "nSamples": BEST_OF_N,
-    }
+    # R3 single-model path has no Best-of-N / IVR validation — report none so
+    # the frontend renders no validation grid.
+    return {"requirements": [], "nSamples": 1}
 
 
 @app.post("/api/offer")
