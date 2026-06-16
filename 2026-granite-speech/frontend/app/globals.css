@@ -2550,6 +2550,9 @@ a.cds--side-nav__link {
   flex: 1;
   min-width: 0;
   height: 44px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
 }
 
 /* User text in light gray */

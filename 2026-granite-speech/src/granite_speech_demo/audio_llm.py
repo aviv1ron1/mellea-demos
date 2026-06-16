@@ -28,6 +28,8 @@ from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
     LLMTextFrame,
     TranscriptionFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -173,10 +175,20 @@ class AudioLLMService(SegmentedSTTService):
         # (barge-in). Pipeline interruption frames stop the TTS already in flight.
         self._utterance_epoch += 1
         await self._cancel_active()
+        # Emit the plain (non-VAD) speaking frame so the auto-attached RTVIObserver
+        # forwards a `userStartedSpeaking` event to the client. The conversation UI
+        # uses it to finalize the previous user turn — without it, every transcript
+        # appends into one ever-growing user bubble instead of one bubble per turn.
+        # (UserStartedSpeakingFrame is a SystemFrame; nothing downstream turns it
+        # into an interruption, so this is display-only.)
+        await self.push_frame(UserStartedSpeakingFrame())
         await super()._handle_user_started_speaking(frame)
 
     async def _handle_user_stopped_speaking(self, frame: VADUserStoppedSpeakingFrame):
         self._user_speaking = False
+        # Mirror of the started frame: forwards `userStoppedSpeaking` so the
+        # conversation UI closes the user turn (see _handle_user_started_speaking).
+        await self.push_frame(UserStoppedSpeakingFrame())
 
         # Assemble the buffered PCM into a WAV (same as the old STT service).
         content = io.BytesIO()
