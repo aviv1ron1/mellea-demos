@@ -7,6 +7,7 @@ import {
   Conversation,
   ConnectButton,
   SpinLoader,
+  VoiceVisualizer,
   usePipecatConnectionState,
   usePipecatConversation,
 } from '@pipecat-ai/voice-ui-kit';
@@ -314,6 +315,35 @@ function IntrinsicSelector({
             classNames={{ message: 'transcript-messages', time: 'transcript-hide' }}
           />
         </div>
+
+        {/* Live audio strip: animates with the active speaker's voice. A pulsing
+            red dot + "Listening" marks the mic-open window where the user's turn
+            is recorded; it flips to a steady blue "Speaking" while the bot talks. */}
+        {isConnected && (
+          <div className="gs-audio-strip">
+            <span
+              className="gs-audio-state"
+              style={{ color: isBotSpeaking ? '#32a6ff' : '#fa4d56' }}
+            >
+              <span
+                className={`gs-audio-dot ${isBotSpeaking ? 'gs-audio-dot--speaking' : 'gs-audio-dot--listening'}`}
+              />
+              {isBotSpeaking ? 'Speaking' : 'Listening'}
+            </span>
+            <div className="gs-audio-viz">
+              <VoiceVisualizer
+                participantType={isBotSpeaking ? 'bot' : 'local'}
+                backgroundColor="transparent"
+                barColor={isBotSpeaking ? '#32a6ff' : '#fa4d56'}
+                barCount={48}
+                barGap={2}
+                barWidth={3}
+                barMaxHeight={40}
+                barOrigin="center"
+              />
+            </div>
+          </div>
+        )}
 
         <div
           style={{
