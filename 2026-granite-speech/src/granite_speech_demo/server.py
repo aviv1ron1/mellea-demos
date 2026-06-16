@@ -20,6 +20,7 @@ from fastapi.responses import Response
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -105,12 +106,15 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, session_config: dict
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            # VAD now lives on the transport so the single audio service gets the
-            # turn-boundary frames it needs (previously the VAD was on the
-            # user aggregator, which we no longer use).
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.4)),
         ),
     )
+
+    # SmallWebRTCTransport ignores vad_analyzer in TransportParams, so we add an
+    # explicit VADProcessor: it emits VADUserStarted/StoppedSpeakingFrame, which
+    # is what SegmentedSTTService (our AudioLLMService) needs to detect a turn
+    # and fire run_stt. (The original demo got these frames via the
+    # LLMContextAggregatorPair's vad_analyzer; we no longer use that aggregator.)
+    vad = VADProcessor(vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.4)))
 
     # R3: one audio-enabled Granite Switch model does audio -> answer in a single
     # request. No separate STT server, no Mellea LLM stage.
@@ -126,6 +130,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, session_config: dict
     pipeline = Pipeline(
         [
             transport.input(),
+            vad,
             audio_llm,
             tts,
             transport.output(),
