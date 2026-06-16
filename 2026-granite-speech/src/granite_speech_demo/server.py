@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 import httpx
+import numpy as np
 import uvicorn
 from dotenv import load_dotenv
 
@@ -20,12 +21,14 @@ from fastapi.responses import Response
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import ErrorFrame, TTSAudioRawFrame
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.tts_service import TextAggregationMode
+from pipecat.utils.tracing.service_decorators import traced_tts
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
@@ -47,6 +50,43 @@ HOST = os.environ.get("HOST", "localhost")
 PORT = int(os.environ.get("PORT", "7860"))
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "kokoro")
 TTS_VOICE = os.environ.get("TTS_VOICE", "af_aoede")
+# Playback tempo for Kokoro. Upstream hardcodes speed=1.0; >1.0 speaks faster.
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.25"))
+
+
+class _FastKokoroTTSService(KokoroTTSService):
+    """KokoroTTSService with a configurable speaking tempo.
+
+    Upstream ``run_tts`` calls ``create_stream(..., speed=1.0)`` with the tempo
+    hardcoded and exposes no setting for it, so we override the method to pass
+    ``TTS_SPEED`` instead. Everything else (streaming, resampling, metrics) is
+    identical to the upstream implementation.
+    """
+
+    @traced_tts
+    async def run_tts(self, text, context_id):
+        loguru_logger.debug(f"{self}: Generating TTS [{text}] @ speed={TTS_SPEED}")
+        try:
+            await self.start_tts_usage_metrics(text)
+            stream = self._kokoro.create_stream(
+                text, voice=self._settings.voice, lang=self._settings.language, speed=TTS_SPEED
+            )
+            async for samples, sample_rate in stream:
+                await self.stop_ttfb_metrics()
+                audio_int16 = (samples * 32767).astype(np.int16).tobytes()
+                audio_data = await self._resampler.resample(
+                    audio_int16, sample_rate, self.sample_rate
+                )
+                yield TTSAudioRawFrame(
+                    audio=audio_data,
+                    sample_rate=self.sample_rate,
+                    num_channels=1,
+                    context_id=context_id,
+                )
+        except Exception as e:
+            yield ErrorFrame(error=f"Unknown error occurred: {e}")
+        finally:
+            await self.stop_ttfb_metrics()
 
 pcs_map: Dict[str, SmallWebRTCConnection] = {}
 active_sessions: Dict[str, Dict[str, Any]] = {}
@@ -122,7 +162,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection, session_config: dict
     if TTS_BACKEND == "hosted":
         tts = HostedTTSService(text_aggregation_mode=TextAggregationMode.SENTENCE)
     else:
-        tts = KokoroTTSService(
+        tts = _FastKokoroTTSService(
             settings=KokoroTTSService.Settings(voice=TTS_VOICE),
             text_aggregation_mode=TextAggregationMode.SENTENCE,
         )

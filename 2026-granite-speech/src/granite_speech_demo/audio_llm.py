@@ -64,7 +64,47 @@ def _load_system_prompt() -> str:
     )
 
 
-SYSTEM_PROMPT = _load_system_prompt()
+def _load_documents() -> str:
+    """Load grounding documents from DOCUMENTS_DIR (default ``docs``) and build a
+    block to prepend to the system prompt. Reads every ``*.txt`` file in the
+    directory and embeds them in <documents></documents> tags, the same shape the
+    old Mellea LLM stage used — so the assistant answers from the demo's curated
+    facts (Granite model family, Granite Switch, the single-model speech design)
+    rather than only general knowledge."""
+    docs_dir = os.environ.get("DOCUMENTS_DIR", "docs")
+    path = Path(docs_dir)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[2] / path
+    if not path.is_dir():
+        return ""
+
+    entries = []
+    for i, txt in enumerate(sorted(path.glob("*.txt"))):
+        text = txt.read_text().strip()
+        if text:
+            entries.append(json.dumps({"text": text, "title": txt.stem, "doc_id": str(i)}))
+    if not entries:
+        return ""
+
+    logger.info("Loaded {} grounding documents from {}", len(entries), path)
+    block = "\n".join(entries)
+    return (
+        "You have access to the following documents; use them to ground your "
+        "answers when relevant. They are given within <documents></documents> "
+        "XML tags:\n"
+        f"<documents>\n{block}\n</documents>\n\n"
+        "Prefer facts from these documents. If the answer is not in them, answer "
+        "from general knowledge or say you don't know.\n\n"
+    )
+
+
+def _build_system_prompt() -> str:
+    persona = _load_system_prompt()
+    documents = _load_documents()
+    return documents + persona if documents else persona
+
+
+SYSTEM_PROMPT = _build_system_prompt()
 
 
 class AudioLLMService(SegmentedSTTService):
