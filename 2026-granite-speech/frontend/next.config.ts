@@ -9,6 +9,11 @@ const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  // Next 16 blocks /_next/* dev resources (HMR + JS chunks) from origins it
+  // considers cross-origin. The app is reached at 127.0.0.1:3000, which Next
+  // treats as different from its own "localhost" origin, so the bundle is
+  // blocked and the page renders blank. Allow the local hosts explicitly.
+  allowedDevOrigins: ["127.0.0.1", "localhost"],
   turbopack: {
     root: projectRoot,
   },
