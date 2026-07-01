@@ -55,26 +55,51 @@ LLM_URL=http://localhost:8000/v1
 
 If you don't have a second GPU, you can skip the Switch server and point `LLM_URL` / `LLM_MODEL` at any OpenAI-compatible backend — the Best-of-N validation path won't work (it requires Switch's `requirement_check` intrinsic), but the streaming conversation path does.
 
-## Run
+### Via OpenShift port-forward
 
-### Both backend and frontend (recommended)
+If the models are already deployed on an OpenShift cluster you can forward them to localhost instead of serving them locally. Open two terminals and keep them running for the duration of the demo:
 
 ```bash
-./run.sh
+# Terminal 1 — LLM (Granite Switch → localhost:8000)
+oc port-forward <llm-pod-name> 8000:8000
+
+# Terminal 2 — STT (Granite Speech → localhost:8083)
+oc port-forward <stt-pod-name> 8083:8083
 ```
 
-Starts the Pipecat backend (http://localhost:7860) and the Next.js frontend (http://localhost:3000) together, with `[backend]` / `[frontend]` line prefixes. Ctrl+C shuts both down cleanly. Bootstraps `.env` from `.env.example` on first run, and runs `npm install` in `frontend/` if `node_modules` is missing.
+If both models run in the same pod you can forward both ports at once:
+
+```bash
+oc port-forward <pod-name> 8000:8000 8083:8083
+```
+
+Then make sure `.env` points at the forwarded ports (the defaults already match):
+
+```bash
+LLM_URL=http://localhost:8000/v1
+VLLM_SPEECH_URL=http://localhost:8083
+```
+
+## Run
+
+### Backend and frontend (recommended)
+
+Open two terminals in the repo root:
+
+```bash
+# Terminal 1 — Pipecat backend (http://localhost:7860)
+./run-backend.sh
+
+# Terminal 2 — Next.js frontend (http://localhost:3000)
+./run-frontend.sh
+```
+
+Open http://localhost:3000. Ctrl+C in either terminal shuts down that process cleanly.
 
 ### Backend only (built-in Pipecat UI)
 
 ```bash
 uv run uvicorn granite_speech_demo.server:app --host localhost --port 7860
-```
-
-Or use the convenience script which loads `.env` and invokes the module entrypoint:
-
-```bash
-./start.sh
 ```
 
 Open http://localhost:7860 — the server redirects to the built-in Pipecat prebuilt UI at `/client/`.
@@ -85,15 +110,9 @@ To serve over HTTPS (required for microphone access from non-localhost origins),
 uv run python -m granite_speech_demo.server --ssl-certfile cert.pem --ssl-keyfile key.pem
 ```
 
-### With the Next.js frontend
-
-The `frontend/` directory contains a single-page Next.js app (Carbon Design System, IBM Plex fonts) that embeds Pipecat's `voice-ui-kit` and exposes a runtime toggle for IVR validation.
+### Frontend only (against a running backend)
 
 ```bash
-# Terminal 1 — start the Pipecat backend
-uv run uvicorn granite_speech_demo.server:app --host localhost --port 7860
-
-# Terminal 2 — start the frontend
 cd frontend
 cp .env.example .env.local   # points at http://127.0.0.1:7860 by default
 npm install
