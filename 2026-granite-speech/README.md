@@ -41,15 +41,35 @@ LLM_URL=http://localhost:8000/v1
 LLM_MODEL=granite-switch-audio   # or whatever model ID vLLM reports
 ```
 
-### Via OpenShift port-forward
+### Via OpenShift Route (recommended)
 
-If the model is already deployed on an OpenShift cluster, forward it to localhost:
+If the model is deployed on an OpenShift cluster, expose it as a Route — this is more stable than port-forwarding.
+
+Find the service name for your vLLM pod, then create a route:
+
+```bash
+oc get svc                                    # find the service name
+oc expose svc/<service-name> --port=8000      # create a route
+oc get route <service-name> -o jsonpath='{.spec.host}'  # get the hostname
+```
+
+Set `LLM_URL` in `.env` to the route hostname:
+
+```
+LLM_URL=http://<route-hostname>/v1
+```
+
+If the route is TLS-terminated use `https://` instead.
+
+### Via OpenShift port-forward (less stable)
+
+Port-forwarding is handy for a quick test but the tunnel can drop mid-demo. Prefer the Route approach above for anything beyond a one-off check.
 
 ```bash
 oc port-forward <pod-name> 8000:8000
 ```
 
-Keep that terminal open for the duration of the demo. Your `.env` should already match the defaults:
+Keep that terminal open. Your `.env` defaults already point at the forwarded port:
 
 ```
 LLM_URL=http://localhost:8000/v1
