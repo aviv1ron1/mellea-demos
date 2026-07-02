@@ -48,18 +48,17 @@ If the model is deployed on an OpenShift cluster, expose it as a Route — this 
 Find the service name for your vLLM pod, then create a route:
 
 ```bash
-oc get svc                                    # find the service name
-oc expose svc/<service-name> --port=8000      # create a route
-oc get route <service-name> -o jsonpath='{.spec.host}'  # get the hostname
+oc get svc                                                        # find the service name
+oc create route edge <service-name> --service=<service-name> \
+  --port=8000 --insecure-policy=Redirect                         # HTTPS edge route
+oc get route <service-name> -o jsonpath='{.spec.host}'           # get the hostname
 ```
 
 Set `LLM_URL` in `.env` to the route hostname:
 
 ```
-LLM_URL=http://<route-hostname>/v1
+LLM_URL=https://<route-hostname>/v1
 ```
-
-If the route is TLS-terminated use `https://` instead.
 
 ### Via OpenShift port-forward (less stable)
 
