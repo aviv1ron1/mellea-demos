@@ -1,0 +1,77 @@
+# Self-hosted TURN relay for WebRTC media. Needed because this VPC-internal
+# cluster has no reachable public TURN and its egress NAT is symmetric (STUN-only
+# P2P fails). Both the browser (on VPN) and the backend pod reach this via the
+# LoadBalancer IP; coturn relays the media between them.
+#
+# NOTE: after the LoadBalancer gets an external IP, coturn must advertise it as
+# its relay address — set EXTERNAL_IP via `oc set env` / patch and it restarts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coturn
+  namespace: granite-speech-demo
+  labels:
+    app: coturn
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coturn
+  template:
+    metadata:
+      labels:
+        app: coturn
+    spec:
+      containers:
+        - name: coturn
+          image: docker.io/coturn/coturn:4.6
+          # All ports >1024 so it runs fine under the restricted (arbitrary-UID) SCC.
+          # external-ip is injected once the LB IP is known (see EXTERNAL_IP env).
+          command: ["turnserver"]
+          args:
+            - "-n"
+            - "--listening-port=3478"
+            - "--min-port=30000"
+            - "--max-port=30009"
+            - "--realm=granite"
+            - "--user=granite:granite"
+            - "--lt-cred-mech"
+            - "--fingerprint"
+            - "--no-tls"
+            - "--no-dtls"
+            - "--no-cli"
+            - "--log-file=stdout"
+          env:
+            - name: EXTERNAL_IP
+              value: ""   # patched to the LB IP after provisioning
+          ports:
+            - { containerPort: 3478, protocol: UDP }
+            - { containerPort: 3478, protocol: TCP }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 250m, memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coturn
+  namespace: granite-speech-demo
+  labels:
+    app: coturn
+spec:
+  type: LoadBalancer
+  selector:
+    app: coturn
+  ports:
+    - { name: turn-udp, port: 3478, targetPort: 3478, protocol: UDP }
+    - { name: turn-tcp, port: 3478, targetPort: 3478, protocol: TCP }
+    - { name: relay-0, port: 30000, targetPort: 30000, protocol: UDP }
+    - { name: relay-1, port: 30001, targetPort: 30001, protocol: UDP }
+    - { name: relay-2, port: 30002, targetPort: 30002, protocol: UDP }
+    - { name: relay-3, port: 30003, targetPort: 30003, protocol: UDP }
+    - { name: relay-4, port: 30004, targetPort: 30004, protocol: UDP }
+    - { name: relay-5, port: 30005, targetPort: 30005, protocol: UDP }
+    - { name: relay-6, port: 30006, targetPort: 30006, protocol: UDP }
+    - { name: relay-7, port: 30007, targetPort: 30007, protocol: UDP }
+    - { name: relay-8, port: 30008, targetPort: 30008, protocol: UDP }
+    - { name: relay-9, port: 30009, targetPort: 30009, protocol: UDP }

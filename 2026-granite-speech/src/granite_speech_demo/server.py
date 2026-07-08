@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -91,28 +92,53 @@ class _FastKokoroTTSService(KokoroTTSService):
 pcs_map: Dict[str, SmallWebRTCConnection] = {}
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
-STUN_FALLBACK = [{"urls": ["stun:stun.l.google.com:19302"]}]
+# Default ICE servers. STUN alone only works when both peers can hole-punch;
+# behind a symmetric NAT (e.g. a cloud/cluster egress) a TURN relay both peers
+# can reach is required. openrelay.metered.ca is a free public TURN service.
+# Override wholesale with the ICE_SERVERS env var (JSON list of RTCIceServer
+# dicts) to point at your own TURN — recommended for anything beyond a demo.
+DEFAULT_ICE_SERVERS = [
+    {"urls": ["stun:stun.l.google.com:19302"]},
+    {
+        "urls": [
+            "turn:openrelay.metered.ca:80",
+            "turn:openrelay.metered.ca:443",
+            "turns:openrelay.metered.ca:443?transport=tcp",
+        ],
+        "username": "openrelayproject",
+        "credential": "openrelayproject",
+    },
+]
 
 
 async def _mint_ice_servers() -> list[dict]:
-    """Mint fresh ICE servers for one session. Falls back to STUN-only if
-    HF_TOKEN is unset or the TURN endpoint is unreachable, so the demo still
-    works on networks where direct WebRTC is possible (e.g. local dev)."""
+    """Return the ICE servers for one session.
+
+    Precedence: an explicit ICE_SERVERS env var (JSON) wins; else mint per-session
+    TURN credentials from fastrtc when HF_TOKEN is set and reachable; else fall
+    back to DEFAULT_ICE_SERVERS (public STUN + TURN)."""
+    env_ice = os.environ.get("ICE_SERVERS")
+    if env_ice:
+        try:
+            return json.loads(env_ice)
+        except Exception as e:
+            logger.warning(f"ICE_SERVERS env is not valid JSON, ignoring: {e}")
+
     hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        return STUN_FALLBACK
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://turn.fastrtc.org/credentials",
-                headers={"Authorization": f"Bearer {hf_token}"},
-                params={"ttl": 3600},
-            )
-            r.raise_for_status()
-            return r.json()["iceServers"]
-    except Exception as e:
-        logger.warning(f"TURN mint failed, falling back to STUN: {e}")
-        return STUN_FALLBACK
+    if hf_token:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    "https://turn.fastrtc.org/credentials",
+                    headers={"Authorization": f"Bearer {hf_token}"},
+                    params={"ttl": 3600},
+                )
+                r.raise_for_status()
+                return r.json()["iceServers"]
+        except Exception as e:
+            logger.warning(f"fastrtc TURN mint failed, using default ICE servers: {e}")
+
+    return DEFAULT_ICE_SERVERS
 
 
 def _ice_servers_from_dicts(servers: list[dict]) -> list[IceServer]:

@@ -381,9 +381,11 @@ function IntrinsicSelector({
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {showConnectingState
                 ? 'Please wait one moment while we connect you with an agent.'
-                : showWaitingForMessages
-                  ? 'Waiting for messages…'
-                  : statusMessage ?? ''}
+                : isBotSpeaking
+                  ? 'Say "stop" to interrupt the agent.'
+                  : showWaitingForMessages
+                    ? 'Waiting for messages…'
+                    : statusMessage ?? ''}
             </span>
           </span>
           {isConnected && (

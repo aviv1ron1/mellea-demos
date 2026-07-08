@@ -1,0 +1,125 @@
+# Next.js frontend: built from the frontend/ dir via a binary build, exposed by
+# an edge-TLS Route. This Route's URL is the public link shared with users.
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: granite-speech-frontend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-frontend
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: granite-speech-frontend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-frontend
+spec:
+  source:
+    type: Binary
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+      imageOptimizationPolicy: SkipLayers
+  output:
+    to:
+      kind: ImageStreamTag
+      name: granite-speech-frontend:latest
+  # Only `requests` count against the namespace quota (2 CPU / 4Gi total).
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "2"
+      memory: 3Gi
+      ephemeral-storage: 12Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: granite-speech-frontend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-frontend
+  annotations:
+    image.openshift.io/triggers: |
+      [{"from":{"kind":"ImageStreamTag","name":"granite-speech-frontend:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"frontend\")].image"}]
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: granite-speech-frontend
+  template:
+    metadata:
+      labels:
+        app: granite-speech-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: image-registry.openshift-image-registry.svc:5000/granite-speech-demo/granite-speech-frontend:latest
+          ports:
+            - containerPort: 3000
+          env:
+            # Server-side proxy target (browser never uses this directly).
+            - name: PIPECAT_BACKEND_URL
+              value: http://granite-speech-backend:7860
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: granite-speech-frontend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-frontend
+spec:
+  selector:
+    app: granite-speech-frontend
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+  type: ClusterIP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: granite-speech-frontend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-frontend
+spec:
+  # Hostname provided by IT for this namespace, served by the namespace's
+  # dedicated (VPC-internal) ingress controller. Without this the Route
+  # auto-assigns an appdomain.cloud host that DNS doesn't route here (503).
+  host: granite-speech-demo.vpc-int.res.ibm.com
+  to:
+    kind: Service
+    name: granite-speech-frontend
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

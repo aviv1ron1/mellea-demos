@@ -1,0 +1,58 @@
+# Pipecat voice backend (FastAPI + WebRTC signaling). CPU-only: Kokoro TTS and
+# Silero VAD run in-pod; the audio LLM is called over HTTPS on another cluster.
+FROM python:3.12-slim
+
+# System deps:
+#   libgomp1              — onnxruntime (Silero VAD) needs libgomp.so.1
+#   libgl1 libglib2.0-0   — cv2 (pulled in by pipecat's WebRTC transport)
+#   espeak-ng             — Kokoro phonemization fallback
+#   curl/ca-certificates  — uv binary copy + model/NLTK pre-fetch
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libgl1 libglib2.0-0 espeak-ng ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv (pinned image, copied in — no pip bootstrap)
+COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /usr/local/bin/uv
+
+# HOME=/app so the arbitrary OpenShift runtime UID resolves ~/.cache to a
+# writable, pre-populated path (see the chmod below).
+ENV HOME=/app \
+    XDG_CACHE_HOME=/app/.cache \
+    HF_HOME=/app/.cache/huggingface \
+    NLTK_DATA=/app/.cache/nltk_data \
+    UV_PROJECT_ENVIRONMENT=/app/.venv \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PYTHONUNBUFFERED=1 \
+    HOST=0.0.0.0 \
+    PORT=7860
+
+WORKDIR /app
+
+# Dependency layer (cached until pyproject/lock/src change).
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+RUN uv sync --frozen --no-dev
+
+# App content the server reads at runtime.
+COPY prompts ./prompts
+COPY docs ./docs
+
+# Pre-fetch the Kokoro ONNX model + voices so pod cold-start does not download
+# ~330 MB on every restart, and make the runtime-writable dirs group-writable —
+# all in one layer. OpenShift runs as an arbitrary UID in group 0; only logs/
+# and .cache/ need write (the rest of /app is world-readable already). Scoping
+# the chgrp/chmod to these two dirs avoids duplicating the whole /app tree into
+# a new image layer (which blew past the build pod's ephemeral-storage limit).
+RUN mkdir -p /app/.cache/kokoro-onnx /app/.cache/nltk_data /app/logs \
+    && curl -fSL -o /app/.cache/kokoro-onnx/kokoro-v1.0.onnx \
+        https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx \
+    && curl -fSL -o /app/.cache/kokoro-onnx/voices-v1.0.bin \
+        https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin \
+    && uv run --no-sync python -c "import nltk; nltk.download('punkt_tab', download_dir='/app/.cache/nltk_data'); nltk.download('punkt', download_dir='/app/.cache/nltk_data')" \
+    && chgrp -R 0 /app/.cache /app/logs \
+    && chmod -R g=u /app/.cache /app/logs
+
+EXPOSE 7860
+# --no-sync: env is already synced above; don't touch the network at startup.
+CMD ["uv", "run", "--no-sync", "python", "-m", "granite_speech_demo.server"]

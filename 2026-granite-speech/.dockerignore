@@ -1,0 +1,15 @@
+# Keep the backend build context (repo root) small and reproducible.
+.git
+.venv
+venv
+**/__pycache__
+*.pyc
+*.egg-info
+logs
+trials
+.env
+.DS_Store
+# Frontend is built by its own image; never ship its node_modules/build here.
+frontend/node_modules
+frontend/.next
+frontend/.turbo

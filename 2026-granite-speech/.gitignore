@@ -8,3 +8,4 @@ build/
 logs/
 trials/
 .DS_Store
+openshift/config.env

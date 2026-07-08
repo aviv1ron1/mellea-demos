@@ -24,6 +24,7 @@ import aiohttp
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
+    InterruptionTaskFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
@@ -33,6 +34,7 @@ from pipecat.frames.frames import (
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.utils.time import time_now_iso8601
 
@@ -57,7 +59,15 @@ _ECHO_PROTOCOL = (
 LLM_URL = os.environ.get("LLM_URL", "http://localhost:8000/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "granite-switch-audio")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "EMPTY")
+# Verify the LLM endpoint's TLS cert. Default on. Set LLM_VERIFY_SSL=false when the
+# endpoint is an OpenShift edge route whose CA isn't in the container trust store
+# (e.g. calling the model on another cluster over HTTPS).
+LLM_VERIFY_SSL = os.environ.get("LLM_VERIFY_SSL", "true").strip().lower() not in ("0", "false", "no")
 MAX_TOKENS = int(os.environ.get("AUDIO_LLM_MAX_TOKENS", "256"))
+HISTORY_TURNS = int(os.environ.get("AUDIO_LLM_HISTORY_TURNS", "5"))
+STOP_WORDS = frozenset(
+    w.strip() for w in os.environ.get("AUDIO_LLM_STOP_WORDS", "stop,stop it,quiet,be quiet").lower().split(",") if w.strip()
+)
 
 
 def _chat_endpoint(url: str) -> str:
@@ -140,14 +150,17 @@ class AudioLLMService(SegmentedSTTService):
         self._endpoint = _chat_endpoint(LLM_URL)
         self._active_task: asyncio.Task | None = None
         self._utterance_epoch: int = 0
+        self._history: list[dict] = []
 
     async def start(self, frame):
         await super().start(frame)
+        connector = None if LLM_VERIFY_SSL else aiohttp.TCPConnector(ssl=False)
         self._session = aiohttp.ClientSession(
+            connector=connector,
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {LLM_API_KEY}",
-            }
+            },
         )
 
     async def stop(self, frame):
@@ -171,16 +184,15 @@ class AudioLLMService(SegmentedSTTService):
         self._active_task = None
 
     async def _handle_user_started_speaking(self, frame: VADUserStartedSpeakingFrame):
-        # Bump epoch so any in-flight response is treated as stale, and cancel it
-        # (barge-in). Pipeline interruption frames stop the TTS already in flight.
         self._utterance_epoch += 1
         await self._cancel_active()
-        # Emit the plain (non-VAD) speaking frame so the auto-attached RTVIObserver
-        # forwards a `userStartedSpeaking` event to the client. The conversation UI
-        # uses it to finalize the previous user turn — without it, every transcript
-        # appends into one ever-growing user bubble instead of one bubble per turn.
-        # (UserStartedSpeakingFrame is a SystemFrame; nothing downstream turns it
-        # into an interruption, so this is display-only.)
+        # Push InterruptionTaskFrame upstream so the pipeline task injects an
+        # InterruptionFrame into the pipeline — this clears the TTS audio buffer
+        # and actually stops playback. Without it, TTS keeps playing through
+        # buffered audio even after the LLM task is cancelled.
+        await self.push_frame(InterruptionTaskFrame(), FrameDirection.UPSTREAM)
+        # UserStartedSpeakingFrame notifies the RTVIObserver so the client UI
+        # finalizes the previous user turn (display-only, not an interruption).
         await self.push_frame(UserStartedSpeakingFrame())
         await super()._handle_user_started_speaking(frame)
 
@@ -226,6 +238,7 @@ class AudioLLMService(SegmentedSTTService):
             "max_tokens": MAX_TOKENS,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
+                *self._history,
                 {
                     "role": "user",
                     "content": [
@@ -241,10 +254,21 @@ class AudioLLMService(SegmentedSTTService):
         # Split the stream into the echoed question (-> user TranscriptionFrame,
         # shown but not spoken) and the answer (-> LLM frames, spoken + shown).
         # State machine over streamed pieces, since markers can straddle chunks.
+        #
+        # The question is buffered (question_pending) and only emitted once the
+        # answer actually begins — see the emit sites below. If the user barges
+        # in before any answer is produced, run_stt is cancelled and the question
+        # is never shown. That's deliberate: the frontend only marks a user bubble
+        # "final" once a bot reply follows it, so an emitted-but-unanswered turn
+        # would strand a non-final bubble that the next turn's transcript merges
+        # into — the "missing user message" symptom. No answer -> no user bubble.
         OPEN, CLOSE = HEARD_OPEN, HEARD_CLOSE
         buf = ""
+        question = ""
+        answer_buf = ""
         open_consumed = False   # we've stripped the leading [heard]
         prefix_done = False     # question resolved; everything after is answer
+        question_pending = False  # question parsed, held until the answer starts
         answer_started = False
 
         def _clean(s: str) -> str:
@@ -281,10 +305,14 @@ class AudioLLMService(SegmentedSTTService):
                     if prefix_done:
                         piece = _clean(content_piece)
                         if piece:
+                            if question_pending:
+                                yield TranscriptionFrame(question, "user", time_now_iso8601())
+                                question_pending = False
                             if not answer_started:
                                 answer_started = True
                                 yield LLMFullResponseStartFrame()
                             yield LLMTextFrame(piece)
+                            answer_buf += piece
                         continue
 
                     buf += content_piece
@@ -307,6 +335,7 @@ class AudioLLMService(SegmentedSTTService):
                                 answer_started = True
                                 yield LLMFullResponseStartFrame()
                                 yield LLMTextFrame(piece)
+                                answer_buf += piece
                             continue
 
                     # Inside the question: wait for [/heard], then split off the rest.
@@ -317,13 +346,22 @@ class AudioLLMService(SegmentedSTTService):
                             buf = ""
                             prefix_done = True
                             if question:
-                                yield TranscriptionFrame(question, "user", time_now_iso8601())
                                 logger.info('audio-llm heard: "{}"', question)
+                                # Hold the transcript; emit it only when the answer
+                                # begins (below). See the state-machine note above.
+                                question_pending = True
+                            if question.lower() in STOP_WORDS:
+                                logger.info("audio-llm stop word detected, aborting response")
+                                return
                             rest = _clean(rest)
                             if rest.strip():
+                                if question_pending:
+                                    yield TranscriptionFrame(question, "user", time_now_iso8601())
+                                    question_pending = False
                                 answer_started = True
                                 yield LLMFullResponseStartFrame()
                                 yield LLMTextFrame(rest)
+                                answer_buf += rest
                         continue  # else: still accumulating the question
 
                 # Stream ended. Flush anything unresolved as answer (defensive: the
@@ -335,8 +373,23 @@ class AudioLLMService(SegmentedSTTService):
                             answer_started = True
                             yield LLMFullResponseStartFrame()
                         yield LLMTextFrame(leftover)
+                        answer_buf += leftover
 
                 if answer_started and epoch == self._utterance_epoch:
+                    if question and answer_buf:
+                        # Store the assistant turn WITH its [heard]...[/heard]
+                        # prefix. The model few-shot-learns from its own history:
+                        # if past assistant turns lack the echo block, it concludes
+                        # the protocol is optional and stops emitting it a few turns
+                        # in — which drops the user's transcript (no "heard" =
+                        # no user bubble) and merges answers together. Keeping the
+                        # prefix here makes every in-context example reinforce it.
+                        self._history.append({"role": "user", "content": question})
+                        self._history.append({
+                            "role": "assistant",
+                            "content": f"{HEARD_OPEN}{question}{HEARD_CLOSE}{answer_buf}",
+                        })
+                        self._history = self._history[-(2 * HISTORY_TURNS):]
                     yield LLMFullResponseEndFrame()
                     logger.info("audio-llm turn done ({:.3f}s)", time.monotonic() - t0)
 

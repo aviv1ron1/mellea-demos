@@ -1,0 +1,132 @@
+# Pipecat voice backend: builds from repo root via a binary build, runs as a
+# single internal (ClusterIP) service. Not exposed by a Route — the frontend's
+# server-side proxy is the only client.
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: granite-speech-backend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-backend
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: granite-speech-backend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-backend
+spec:
+  source:
+    type: Binary
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile.backend
+      # Squash into fewer layers so buildah keeps less on the pod's scratch disk.
+      imageOptimizationPolicy: SkipLayers
+  output:
+    to:
+      kind: ImageStreamTag
+      name: granite-speech-backend:latest
+  # Only `requests` count against the namespace quota (2 CPU / 4Gi total). Keep
+  # them modest; the build can burst up to the limits. deploy.sh scales the
+  # Deployments to 0 during the build so the build pod has room.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+      # LimitRange defaults ephemeral-storage to 4Gi/container, which buildah
+      # (context + image layers on the pod's scratch volume) exceeds. Raise it.
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "2"
+      memory: 3Gi
+      ephemeral-storage: 12Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: granite-speech-backend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-backend
+  annotations:
+    # Redeploy automatically when a new image is built and tagged :latest.
+    image.openshift.io/triggers: |
+      [{"from":{"kind":"ImageStreamTag","name":"granite-speech-backend:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"backend\")].image"}]
+spec:
+  # MUST stay 1: WebRTC session state (pcs_map / active_sessions) is in-memory,
+  # so /start and /offer for one session must hit the same pod.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: granite-speech-backend
+  template:
+    metadata:
+      labels:
+        app: granite-speech-backend
+    spec:
+      # The cluster's internal resolver can't resolve public names, so STUN/TURN
+      # (and the fastrtc credentials host) fail and WebRTC can't gather reflexive
+      # candidates. This pod only calls public endpoints (the LLM route and
+      # STUN/TURN — all publicly resolvable), so point it at a public resolver.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 1.1.1.1
+          - 8.8.8.8
+      containers:
+        - name: backend
+          image: image-registry.openshift-image-registry.svc:5000/granite-speech-demo/granite-speech-backend:latest
+          ports:
+            - containerPort: 7860
+          envFrom:
+            - configMapRef:
+                name: granite-speech-config
+            - secretRef:
+                name: granite-speech-secrets
+          volumeMounts:
+            - name: prompt
+              mountPath: /app/prompts-custom
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /api/ivr/config
+              port: 7860
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/ivr/config
+              port: 7860
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: prompt
+          configMap:
+            name: granite-speech-prompt
+            optional: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: granite-speech-backend
+  namespace: granite-speech-demo
+  labels:
+    app: granite-speech-backend
+spec:
+  selector:
+    app: granite-speech-backend
+  ports:
+    - name: http
+      port: 7860
+      targetPort: 7860
+  type: ClusterIP
